@@ -10,10 +10,18 @@ import {
 } from './persist';
 import { analyseRaid, type Metric, type RaidTarget } from './raidpath';
 import { anchorFrom, exportDze, MAPS, piecesFromDze, readDze, type Anchor, type ExportMode } from './dayz';
-import { Store } from './store';
+import { Store, type Piece } from './store';
 import { renderThumbs } from './thumbs';
 import { WalkMode } from './walk';
 import { instance, loadModel, missingTextures, modelName, openedPbos, openPbos, placeholder, placeSite, pboModels, sanitizeSites, siteKey, type SiteRef } from './house';
+
+const hasOwn = Object.prototype.hasOwnProperty;
+const timeFormatter = new Intl.DateTimeFormat('de-DE', { hour: '2-digit', minute: '2-digit' });
+const nameCollator = new Intl.Collator();
+const MAX_JSON_IMPORT_BYTES = 20 * 1024 * 1024;
+
+const CAT_COUNTS: Record<Category, number> = { wood: 0, cinder: 0, metal: 0, fort: 0, general: 0, furniture: 0 };
+for (const id of PART_ORDER) CAT_COUNTS[PARTS[id].cat]++;
 
 // ------------------------------------------------------------------ layout
 const app = document.getElementById('app')!;
@@ -96,7 +104,7 @@ let sites: SiteRef[] = [];
 const siteObjects = new Map<string, THREE.Object3D>();
 const siteState = new Map<string, 'ok' | 'missing' | 'error' | 'loading'>();
 /** models of all opened PBOs */
-let catalog: { pbo: string; name: string; size: number; building: boolean }[] | null = null;
+let catalog: { pbo: string; pboLow: string; name: string; nameLow: string; size: number; building: boolean }[] | null = null;
 let onlyBuildings = true;
 let houseQuery = '';
 let houseBusy = '';
@@ -125,6 +133,8 @@ editor.partLimit = settings.partLimit;
 if (import.meta.env.DEV) Object.assign(window, { __ed: editor, __store: store });
 
 // --------------------------------------------------------------- walk HUD
+let lastWalkHudKey = '';
+let lastWalkHint: string | null = null;
 const walk = new WalkMode(
   editor,
   {
@@ -134,21 +144,33 @@ const walk = new WalkMode(
       for (const id of ['panel', 'levels', 'status', 'selcard']) $(id).style.visibility = v ? 'hidden' : '';
       document.querySelector<HTMLElement>('.toolbar')!.style.visibility = v ? 'hidden' : '';
       document.querySelector<HTMLElement>('.topleft')!.style.visibility = v ? 'hidden' : '';
+      if (!v) {
+        lastWalkHudKey = '';
+        lastWalkHint = null;
+      }
     },
     update(s) {
       $('walkCta').hidden = s.locked;
-      const hint = $('walkHint');
-      hint.hidden = !s.hint;
-      hint.textContent = s.hint ?? '';
-      const st = { stand: 'Stehend', crouch: 'Geduckt', prone: 'Liegend' }[s.stance];
-      $('walkHud').innerHTML = `
-        <span class="pill on">${I.walk.replace('<svg', '<svg width="14" height="14"')} Laufmodus</span>
-        <span class="pill">${st}</span>
-        <span class="pill ${s.noclip ? 'on' : ''}">No-Clip ${s.noclip ? 'an' : 'aus'}</span>
-        <span class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> gehen · <kbd>Shift</kbd> rennen · <kbd>Leertaste</kbd> springen ·
-        <kbd>C</kbd> ducken · <kbd>Z</kbd> hinlegen · <kbd>F</kbd> Tür · <kbd>N</kbd> No-Clip · <kbd>Esc</kbd> beenden</span>
-        <button class="btn" id="walkExit">Beenden</button>`;
-      $('walkExit').onclick = () => walk.exit();
+      const hintText = s.hint ?? '';
+      if (hintText !== lastWalkHint) {
+        lastWalkHint = hintText;
+        const hint = $('walkHint');
+        hint.hidden = !hintText;
+        hint.textContent = hintText;
+      }
+      const hudKey = `${s.stance}|${s.noclip ? 1 : 0}`;
+      if (hudKey !== lastWalkHudKey) {
+        lastWalkHudKey = hudKey;
+        const st = { stand: 'Stehend', crouch: 'Geduckt', prone: 'Liegend' }[s.stance];
+        $('walkHud').innerHTML = `
+          <span class="pill on">${I.walk.replace('<svg', '<svg width="14" height="14"')} Laufmodus</span>
+          <span class="pill">${st}</span>
+          <span class="pill ${s.noclip ? 'on' : ''}">No-Clip ${s.noclip ? 'an' : 'aus'}</span>
+          <span class="k"><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> gehen · <kbd>Shift</kbd> rennen · <kbd>Leertaste</kbd> springen ·
+          <kbd>C</kbd> ducken · <kbd>Z</kbd> hinlegen · <kbd>F</kbd> Tür · <kbd>N</kbd> No-Clip · <kbd>Esc</kbd> beenden</span>
+          <button class="btn" id="walkExit">Beenden</button>`;
+        $('walkExit').onclick = () => walk.exit();
+      }
     },
   },
   () => renderToolbar(),
@@ -173,6 +195,12 @@ function download(name: string, href: string) {
   a.click();
 }
 
+function downloadBlob(name: string, blob: Blob) {
+  const url = URL.createObjectURL(blob);
+  download(name, url);
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
 const fileSafe = (s: string) => s.replace(/[^\w\-äöüÄÖÜß ]+/g, '').trim().replace(/\s+/g, '-') || 'basis';
 
 // --------------------------------------------------------------- designs
@@ -191,7 +219,7 @@ function persistNow() {
   design.updated = Date.now();
   try {
     saveDesign(design);
-    const t = new Date().toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+    const t = timeFormatter.format(new Date());
     $('saveState').textContent = `Gespeichert ${t}`;
     $('saveState').classList.remove('dirty');
   } catch {
@@ -208,7 +236,11 @@ function openDesign(d: Design) {
   void syncSites();
   editor.setActivePart(null);
   editor.frameAll();
-  saveDesign(design);
+  try {
+    saveDesign(design);
+  } catch {
+    /* private mode or quota exceeded */
+  }
   $('saveState').textContent = 'Gespeichert';
   $('saveState').classList.remove('dirty');
   renderAll();
@@ -220,7 +252,7 @@ function renderDesignsMenu() {
   m.innerHTML = `
     <h6>Deine Pläne</h6>
     ${list
-      .map((d) => `<button class="menu-item ${d.id === design.id ? 'current' : ''}" data-open="${d.id}">${I.folder}<span>${esc(d.name)}</span><small>${d.pieces.length} Teile</small></button>`)
+      .map((d) => `<button class="menu-item ${d.id === design.id ? 'current' : ''}" data-open="${esc(d.id)}">${I.folder}<span>${esc(d.name)}</span><small>${d.pieces.length} Teile</small></button>`)
       .join('') || '<div class="info" style="padding:0 8px">Noch keine.</div>'}
     <hr>
     <button class="menu-item" data-act="new">${I.plus}<span>Neuer Plan</span></button>
@@ -259,7 +291,7 @@ $('designsMenu').onclick = (e) => {
       break;
     case 'export': {
       const blob = new Blob([JSON.stringify({ app: 'aftermath-base-planner', v: 1, name: design.name, pieces: strip(store.all()), sites }, null, 1)], { type: 'application/json' });
-      download(fileSafe(design.name) + '.json', URL.createObjectURL(blob));
+      downloadBlob(fileSafe(design.name) + '.json', blob);
       break;
     }
     case 'dze-import':
@@ -283,17 +315,25 @@ $('designsMenu').onclick = (e) => {
 };
 
 ($('importFile') as HTMLInputElement).onchange = async (e) => {
-  const f = (e.target as HTMLInputElement).files?.[0];
+  const input = e.target as HTMLInputElement;
+  const f = input.files?.[0];
+  input.value = '';
   if (!f) return;
+  if (f.size > MAX_JSON_IMPORT_BYTES) {
+    toast('Datei ist zu groß (max. 20 MB)');
+    return;
+  }
   try {
-    const data = JSON.parse(await f.text());
-    const pieces = sanitize(data.pieces);
-    openDesign({ id: newId(), name: String(data.name ?? f.name.replace(/\.json$/, '')).slice(0, 60), updated: Date.now(), pieces, sites: sanitizeSites(data.sites) });
+    const data: unknown = JSON.parse(await f.text());
+    if (!data || typeof data !== 'object') throw new Error('invalid');
+    const obj = data as { name?: unknown; pieces?: unknown; sites?: unknown };
+    const pieces = sanitize(obj.pieces);
+    const rawName = typeof obj.name === 'string' && obj.name.trim() ? obj.name : f.name.replace(/\.json$/i, '');
+    openDesign({ id: newId(), name: rawName.slice(0, 60), updated: Date.now(), pieces, sites: sanitizeSites(obj.sites) });
     toast(`${pieces.length} Teile importiert`);
   } catch {
     toast('Datei konnte nicht gelesen werden');
   }
-  (e.target as HTMLInputElement).value = '';
 };
 
 $('designName').addEventListener('input', markDirty);
@@ -357,7 +397,9 @@ async function share() {
 // ---------------------------------------------------------------- levels
 function renderLevels() {
   const counts = new Array(MAX_LEVEL + 1).fill(0);
-  for (const p of store.pieces.values()) counts[p.l]++;
+  for (const p of store.pieces.values()) {
+    if (p.l >= 0 && p.l <= MAX_LEVEL) counts[p.l]++;
+  }
   const btns = [];
   for (let l = MAX_LEVEL; l >= 0; l--) {
     btns.push(`<button class="lv ${editor.level === l ? 'active' : ''}" data-l="${l}" title="${levelName(l)} (Bild↑/Bild↓)">${l === 0 ? 'G' : l}${counts[l] ? `<span class="n">${counts[l]}</span>` : ''}</button>`);
@@ -378,12 +420,12 @@ $('levels').onclick = (e) => {
 };
 
 // ----------------------------------------------------------------- panel
-function currentRoute() {
+function currentRoute(pieces: Piece[]) {
   if (tab !== 'raid' || !route.target) {
     editor.clearRaidPath();
     return null;
   }
-  const res = analyseRaid(store.all(), route.target, route.metric);
+  const res = analyseRaid(pieces, route.target, route.metric);
   editor.showRaidPath(res.reachable ? res.path : [], route.target, res.steps.map((s) => s.pieceId));
   return res;
 }
@@ -397,7 +439,7 @@ function renderPanel() {
     tab === 'mat' ? renderMaterials(pieces, settings)
     : tab === 'phase' ? renderPhases(pieces)
     : tab === 'upkeep' ? renderUpkeep(pieces, settings)
-    : renderRaid(pieces, { ...route, result: currentRoute() });
+    : renderRaid(pieces, { ...route, result: currentRoute(pieces) });
   document.querySelectorAll<HTMLElement>('.tab').forEach((t) => t.classList.toggle('on', t.dataset.tab === tab));
 }
 
@@ -414,7 +456,10 @@ $('tabBody').addEventListener('change', (e) => {
   if (opt === 'rawNails' || opt === 'rawSheet') settings[opt] = el.checked;
   if (opt === 'rawPlanks') settings.rawPlanks = (el.value || false) as Settings['rawPlanks'];
   if (opt === 'raidMetric') route.metric = el.value as Metric;
-  if (el.dataset.price) settings.upkeepPrices[el.dataset.price] = Math.max(0, Number(el.value) || 0);
+  const priceKey = el.dataset.price;
+  if (priceKey && priceKey !== '__proto__' && priceKey !== 'constructor' && priceKey !== 'prototype') {
+    settings.upkeepPrices[priceKey] = Math.max(0, Number(el.value) || 0);
+  }
   saveSettings(settings);
   renderPanel();
 });
@@ -439,10 +484,9 @@ $('tabBody').addEventListener('click', async (e) => {
 
 // ---------------------------------------------------------------- catalog
 function renderCatalogHead() {
-  $('catHead').innerHTML = `${CATEGORIES.map((c) => {
-    const n = PART_ORDER.filter((id) => PARTS[id].cat === c.id).length;
-    return `<button class="ctab ${!search && catTab === c.id ? 'on' : ''}" data-cat="${c.id}">${c.name}<small>${n}</small></button>`;
-  }).join('')}
+  $('catHead').innerHTML = `${CATEGORIES.map((c) =>
+    `<button class="ctab ${!search && catTab === c.id ? 'on' : ''}" data-cat="${c.id}">${c.name}<small>${CAT_COUNTS[c.id]}</small></button>`
+  ).join('')}
     <label class="search">${I.search.replace('<svg', '<svg width="15" height="15"')}<input id="search" placeholder="Teile suchen" value="${esc(search)}"></label>
     <button class="tb cat-toggle" id="catToggle" title="Leiste ein-/ausklappen">${I.chevron}</button>`;
   ($('search') as HTMLInputElement).oninput = (e) => {
@@ -469,6 +513,13 @@ function renderCards() {
   for (const c of $('cards').querySelectorAll<HTMLCanvasElement>('canvas[data-thumb]')) paintThumb(c);
 }
 
+/** Update active-card highlight without tearing down and redrawing every thumbnail canvas. */
+function syncActiveCard() {
+  for (const b of $('cards').querySelectorAll<HTMLElement>('.card[data-part]')) {
+    b.classList.toggle('on', b.dataset.part === editor.activePart);
+  }
+}
+
 /** Copy a rendered preview into a card canvas (no toDataURL, so canvas-blocking browsers still show it). */
 function paintThumb(c: HTMLCanvasElement) {
   const src = thumbs.get(c.dataset.thumb!);
@@ -488,6 +539,7 @@ $('cards').addEventListener('click', (e) => {
   const b = (e.target as HTMLElement).closest<HTMLElement>('[data-part]');
   if (!b) return;
   const id = b.dataset.part!;
+  if (!hasOwn.call(PARTS, id)) return;
   editor.setActivePart(editor.activePart === id ? null : id);
   if (editor.activePart) {
     const k = PARTS[id].kind;
@@ -496,64 +548,72 @@ $('cards').addEventListener('click', (e) => {
       renderLevels();
     }
   }
-  renderCards();
+  syncActiveCard();
   renderStatus();
 });
 
 // ------------------------------------------------------- status/selection
+let lastStatusHtml = '';
 function renderStatus() {
   const s = $('status');
   const moving = editor.moving != null ? store.pieces.get(editor.moving) : null;
   const part = moving?.t ?? editor.activePart;
-  if (!part) {
-    s.hidden = true;
+  if (!part || !hasOwn.call(PARTS, part)) {
+    if (!s.hidden) s.hidden = true;
     return;
   }
   const d = PARTS[part];
   const v = editor.verdict;
   const mode = editor.placement ? (editor.placement.snapped ? 'Eingerastet' : 'Frei') : d.kind === 'bars' ? 'Zeige auf ein Fenster' : 'Zeige auf die Fläche';
-  s.hidden = false;
+  if (s.hidden) s.hidden = false;
   const o = editor.offset;
-  const cm = (v: number) => `${v >= 0 ? '+' : ''}${Math.round(v * 100)}`;
+  const cm = (val: number) => `${val >= 0 ? '+' : ''}${Math.round(val * 100)}`;
   const off = editor.hasOffset()
     ? `<span class="mode">Versatz ${cm(o.x)} / ${cm(o.y)} / ${cm(o.z)} cm${Math.abs(editor.offsetYaw) > 1e-6 ? ` · ${Math.round((editor.offsetYaw * 180) / Math.PI)}°` : ''} <kbd>Pos1</kbd> zurück</span>`
     : '';
-  s.innerHTML = `<b>${esc(d.name)}</b><span class="mode">${mode}</span>${off}
+  const html = `<b>${esc(d.name)}</b><span class="mode">${mode}</span>${off}
     ${v && !v.ok ? `<span class="bad">${esc(v.reason ?? '')}</span>` : ''}
     ${moving
       ? '<span class="k">Verschieben: <kbd>Loslassen</kbd> absetzen · <kbd>Q</kbd><kbd>E</kbd> drehen · <kbd>←↑↓→</kbd> <kbd>Bild↑↓</kbd> fein · <kbd>Esc</kbd> abbrechen</span>'
       : '<span class="k"><kbd>Klick</kbd> setzen · <kbd>Q</kbd><kbd>E</kbd> drehen · <kbd>←↑↓→</kbd> <kbd>Bild↑↓</kbd> fein verschieben · <kbd>X</kbd> Einrasten · <kbd>Rechtsklick</kbd>/<kbd>Esc</kbd> fertig</span>'}`;
+  if (html !== lastStatusHtml) {
+    lastStatusHtml = html;
+    s.innerHTML = html;
+  }
 }
 
 function renderSelection() {
   const c = $('selcard');
   const id = editor.selected;
   const p = id != null ? store.pieces.get(id) : null;
-  if (!p) {
+  if (!p || !hasOwn.call(PARTS, p.t)) {
     c.hidden = true;
     return;
   }
   const d = PARTS[p.t];
+  const cost = costLine(p.t);
   c.hidden = false;
-  c.innerHTML = `<div><div class="nm">${esc(d.name)}</div><div class="lv-tag">${levelName(p.l)}${costLine(p.t) ? ' · ' + esc(costLine(p.t)!) : ''}</div></div>
+  c.innerHTML = `<div><div class="nm">${esc(d.name)}</div><div class="lv-tag">${levelName(p.l)}${cost ? ' · ' + esc(cost) : ''}</div></div>
     <button class="btn" id="selSame">${I.plus} Noch eins</button>
     <button class="btn danger" id="selDel">${I.trash} Entfernen</button>`;
   $('selSame').onclick = () => {
     editor.setLevel(p.l);
     editor.setActivePart(p.t);
     renderLevels();
-    renderCards();
+    syncActiveCard();
     renderStatus();
   };
   $('selDel').onclick = () => editor.deleteSelected();
 }
 
 // ------------------------------------------------------------------ help
+let helpBuilt = false;
 function toggleHelp(force?: boolean) {
   const h = $('help');
   const show = force ?? h.hidden;
   h.hidden = !show;
-  if (!show) return;
+  if (!show || helpBuilt) return;
+  helpBuilt = true;
   const row = (k: string, t: string) => `<div><span>${t}</span><span>${k}</span></div>`;
   h.innerHTML = `<div class="float help" style="position:relative">
     <button class="tb close" id="helpClose">${I.x}</button>
@@ -604,6 +664,7 @@ $('help').addEventListener('click', (e) => {
 });
 
 // ------------------------------------------------------------- keyboard
+const ZERO_VEC = new THREE.Vector3();
 window.addEventListener('keydown', (e) => {
   if (walk.active) return;
   if ((e.target as HTMLElement)?.closest?.('input,textarea,select')) return;
@@ -621,29 +682,31 @@ window.addEventListener('keydown', (e) => {
   }
   if (ctrl) {
     // Ctrl alone flies down; keep the browser from saving, bookmarking or selecting meanwhile
-    if (['s', 'a', 'd', ' '].includes(k)) e.preventDefault();
+    if (k === 's' || k === 'a' || k === 'd' || k === ' ') e.preventDefault();
     return;
   }
   // fine adjustment: arrows along the ground (relative to the view), Page Up/Down height
-  const step = e.altKey ? 0.01 : e.shiftKey ? 0.25 : 0.05;
-  const ax = editor.viewAxes();
-  const nudges: Record<string, THREE.Vector3> = {
-    arrowup: ax.fwd.clone().multiplyScalar(step),
-    arrowdown: ax.fwd.clone().multiplyScalar(-step),
-    arrowright: ax.right.clone().multiplyScalar(step),
-    arrowleft: ax.right.clone().multiplyScalar(-step),
-    pageup: new THREE.Vector3(0, step, 0),
-    pagedown: new THREE.Vector3(0, -step, 0),
-  };
-  if (nudges[k]) {
+  if (k === 'arrowup' || k === 'arrowdown' || k === 'arrowleft' || k === 'arrowright' || k === 'pageup' || k === 'pagedown') {
     e.preventDefault();
-    if (editor.nudge(nudges[k])) {
+    const step = e.altKey ? 0.01 : e.shiftKey ? 0.25 : 0.05;
+    let delta: THREE.Vector3;
+    if (k === 'pageup') delta = new THREE.Vector3(0, step, 0);
+    else if (k === 'pagedown') delta = new THREE.Vector3(0, -step, 0);
+    else {
+      const ax = editor.viewAxes();
+      delta =
+        k === 'arrowup' ? ax.fwd.multiplyScalar(step)
+        : k === 'arrowdown' ? ax.fwd.multiplyScalar(-step)
+        : k === 'arrowright' ? ax.right.multiplyScalar(step)
+        : ax.right.multiplyScalar(-step);
+    }
+    if (editor.nudge(delta)) {
       renderStatus();
       renderSelection();
     } else toast('Erst ein Teil wählen oder in die Hand nehmen, dann fein verschieben');
     return;
   }
-  if (/^[0-7]$/.test(k)) {
+  if (k.length === 1 && k >= '0' && k <= '7') {
     editor.setLevel(Number(k));
     renderLevels();
     return;
@@ -656,13 +719,13 @@ window.addEventListener('keydown', (e) => {
   switch (k) {
     case 'escape':
       if (!$('dayz').hidden) toggleDayz(false);
-      if (!$('houses').hidden) toggleHouses(false);
+      else if (!$('houses').hidden) toggleHouses(false);
       else if (editor.moving != null) editor.endMove(false);
       else if (editor.raidPick) editor.setRaidPick(false);
       else if (!$('help').hidden) toggleHelp(false);
       else if (editor.activePart) editor.setActivePart(null);
       else editor.select(null);
-      renderCards();
+      syncActiveCard();
       renderStatus();
       break;
     case 'q':
@@ -672,9 +735,9 @@ window.addEventListener('keydown', (e) => {
       const inHand = editor.activePart || editor.moving != null;
       if (e.altKey) {
         e.preventDefault();
-        editor.nudge(new THREE.Vector3(), (dir * Math.PI) / 180); // 1°
+        editor.nudge(ZERO_VEC, (dir * Math.PI) / 180); // 1°
       } else if (inHand) editor.rotate(dir, e.shiftKey);
-      else if (editor.selected != null) editor.nudge(new THREE.Vector3(), dir * (e.shiftKey ? Math.PI / 2 : Math.PI / 12));
+      else if (editor.selected != null) editor.nudge(ZERO_VEC, dir * (e.shiftKey ? Math.PI / 2 : Math.PI / 12));
       renderStatus();
       break;
     }
@@ -757,15 +820,37 @@ renderThumbs(PART_ORDER, (id, canvas) => {
 // ------------------------------------------------------- DayZ Editor (.dze)
 const ANCHOR_KEY = 'abp.dayzAnchor.v1';
 function loadAnchor(): Anchor {
+  const def: Anchor = { map: 'chernarusplus', x: 0, y: 0, z: 0, yaw: 0 };
   try {
-    return { map: 'chernarusplus', x: 0, y: 0, z: 0, yaw: 0, ...JSON.parse(localStorage.getItem(ANCHOR_KEY) ?? '{}') };
+    const raw = JSON.parse(localStorage.getItem(ANCHOR_KEY) ?? '{}');
+    if (!raw || typeof raw !== 'object') return def;
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    return {
+      map: typeof raw.map === 'string' && raw.map ? raw.map : def.map,
+      x: num(raw.x),
+      y: num(raw.y),
+      z: num(raw.z),
+      yaw: num(raw.yaw),
+    };
   } catch {
-    return { map: 'chernarusplus', x: 0, y: 0, z: 0, yaw: 0 };
+    return def;
   }
 }
 let anchor = loadAnchor();
-let exportMode: ExportMode = (localStorage.getItem('abp.dayzMode.v1') as ExportMode) || 'model';
-const saveAnchor = () => localStorage.setItem(ANCHOR_KEY, JSON.stringify(anchor));
+let exportMode: ExportMode = (() => {
+  try {
+    return localStorage.getItem('abp.dayzMode.v1') === 'class' ? 'class' : 'model';
+  } catch {
+    return 'model';
+  }
+})();
+const saveAnchor = () => {
+  try {
+    localStorage.setItem(ANCHOR_KEY, JSON.stringify(anchor));
+  } catch {
+    /* private mode */
+  }
+};
 
 function toggleDayz(force?: boolean) {
   const h = $('dayz');
@@ -827,7 +912,7 @@ $('dayz').addEventListener('click', async (e) => {
   if (act === 'export') {
     const res = exportDze(store.all(), anchor, exportMode);
     const blob = new Blob([res.binary as BlobPart], { type: 'application/octet-stream' });
-    download(fileSafe(design.name) + '.dze', URL.createObjectURL(blob));
+    downloadBlob(fileSafe(design.name) + '.dze', blob);
     toast(`${res.count} Teile exportiert${res.skipped.length ? `, ${res.skipped.length} ohne DayZ-Klasse übersprungen` : ''}`);
   }
 });
@@ -837,8 +922,12 @@ $('dayz').addEventListener('change', (e) => {
   const k = el.dataset.dz;
   if (k === 'map') anchor.map = el.value;
   if (k === 'mode') {
-    exportMode = el.value as ExportMode;
-    localStorage.setItem('abp.dayzMode.v1', exportMode);
+    exportMode = el.value === 'class' ? 'class' : 'model';
+    try {
+      localStorage.setItem('abp.dayzMode.v1', exportMode);
+    } catch {
+      /* private mode */
+    }
     return;
   }
   if (k === 'x' || k === 'y' || k === 'z' || k === 'yaw') anchor[k] = Number(el.value) || 0;
@@ -859,7 +948,7 @@ $('dayz').addEventListener('change', (e) => {
     }
     anchor = a;
     saveAnchor();
-    renderDayz(`Bauplatz übernommen: ${dze.objects[0].type} bei ${a.x.toFixed(1)} / ${a.z.toFixed(1)}, Höhe ${a.y.toFixed(1)}, Richtung ${a.yaw.toFixed(0)}°.`);
+    renderDayz(`Bauplatz übernommen: ${esc(dze.objects[0].type)} bei ${a.x.toFixed(1)} / ${a.z.toFixed(1)}, Höhe ${a.y.toFixed(1)}, Richtung ${a.yaw.toFixed(0)}°.`);
   } catch (err) {
     renderDayz(`Datei konnte nicht gelesen werden (${esc(String((err as Error).message ?? err))}).`);
   }
@@ -886,12 +975,20 @@ $('dayz').addEventListener('change', (e) => {
 };
 
 // ------------------------------------------------ buildings from DayZ files
+function disposePlaceholder(obj: THREE.Object3D) {
+  if (!obj.userData.placeholder) return;
+  obj.traverse((o) => {
+    const geom = (o as THREE.Mesh).geometry;
+    if (geom) geom.dispose();
+  });
+}
 
 async function syncSites() {
   const want = new Set(sites.map((s) => s.id));
   for (const [id, obj] of siteObjects) {
     if (!want.has(id)) {
       editor.sites.remove(obj);
+      disposePlaceholder(obj);
       siteObjects.delete(id);
       siteState.delete(id);
     }
@@ -915,6 +1012,7 @@ async function syncSites() {
           const inst = instance(tpl);
           inst.userData.key = siteKey(s.pbo, s.path);
           editor.sites.remove(cur);
+          disposePlaceholder(cur);
           editor.sites.add(inst);
           siteObjects.set(s.id, inst);
           s.size = tpl.userData.size;
@@ -940,7 +1038,8 @@ function toggleHouses(force?: boolean) {
 
 function renderHouses(note = '') {
   const n = (v: number) => (Math.round(v * 100) / 100).toString();
-  const missing = [...new Set(sites.filter((s) => siteState.get(s.id) === 'missing').map((s) => s.pbo))];
+  const missingSites = sites.filter((s) => siteState.get(s.id) === 'missing');
+  const missing = [...new Set(missingSites.map((s) => s.pbo))];
   $('houses').innerHTML = `<div class="float help dayz" style="position:relative">
     <button class="tb close" data-hs="close">${I.x}</button>
     <h2>Gebäude aus DayZ</h2>
@@ -952,7 +1051,7 @@ function renderHouses(note = '') {
       ${catalog ? `<span class="info" style="margin:0">${openedPbos().length} PBOs geöffnet · ${catalog.length} Modelle</span>` : ''}
     </div>
     <p class="info">Wähle den Ordner <code>Steam\\steamapps\\common\\DayZ\\Addons</code>. Dann findet der Planer zu jedem Gebäude auch die Texturen, die oft in anderen PBOs liegen (z. B. <b>structures_data.pbo</b>). Der Browser fragt dabei, ob er die Dateien „hochladen“ darf – das ist nur der Standardtext: Sie werden ausschließlich lokal gelesen. Für Mod-Gebäude zusätzlich den <code>Addons</code>-Ordner des Mods wählen.</p>
-    ${missing.length ? `<div class="warn">Für ${missing.length > 1 || sites.filter((s) => siteState.get(s.id) === 'missing').length > 1 ? 'einige Gebäude' : 'ein Gebäude'} dieses Plans fehlt das Modell. Wähle ${missing.map((p) => `<b>${esc(p)}</b>`).join(', ')}.</div>` : ''}
+    ${missing.length ? `<div class="warn">Für ${missingSites.length > 1 ? 'einige Gebäude' : 'ein Gebäude'} dieses Plans fehlt das Modell. Wähle ${missing.map((p) => `<b>${esc(p)}</b>`).join(', ')}.</div>` : ''}
     ${houseBusy ? `<div class="info box">${esc(houseBusy)}</div>` : ''}
     ${note ? `<div class="info box">${note}</div>` : ''}
     ${missingTextures.size && sites.length ? `<div class="warn">${missingTextures.size} Texturen nicht gefunden – wähle den ganzen Addons-Ordner, damit auch die gemeinsamen Texturen gefunden werden.</div>` : ''}
@@ -964,7 +1063,7 @@ function renderHouses(note = '') {
     <div class="hs-sites">${sites
       .map((s) => {
         const st = siteState.get(s.id);
-        return `<div class="hs-site" data-id="${s.id}">
+        return `<div class="hs-site" data-id="${esc(s.id)}">
         <b title="${esc(s.pbo + ' · ' + s.path)}">${esc(s.name)}</b>
         ${st === 'missing' ? `<span class="warn" style="margin:0 0 0 8px">Modell fehlt – ${esc(s.pbo)} wählen</span>` : st === 'error' ? '<span class="warn" style="margin:0 0 0 8px">Modell nicht lesbar</span>' : st === 'loading' ? '<span class="info" style="margin:0 0 0 8px">lädt …</span>' : ''}
         <div class="dz-row">
@@ -987,12 +1086,20 @@ function renderHouseList() {
   const el = document.getElementById('hsList');
   if (!el || !catalog) return;
   const q = houseQuery.trim().toLowerCase();
-  const hits = catalog.filter((m) => (!onlyBuildings || m.building) && (!q || m.name.toLowerCase().includes(q) || m.pbo.toLowerCase().includes(q)));
+  const rows: string[] = [];
+  let totalHits = 0;
+  for (let i = 0; i < catalog.length; i++) {
+    const m = catalog[i];
+    if (onlyBuildings && !m.building) continue;
+    if (q && !m.nameLow.includes(q) && !m.pboLow.includes(q)) continue;
+    totalHits++;
+    if (rows.length < 250) {
+      rows.push(`<button class="hs-item" data-hs="add" data-pbo="${esc(m.pbo)}" data-path="${esc(m.name)}"><span>${esc(modelName(m.name))}</span><small>${esc(m.pbo)} · ${esc(m.name)} · ${(m.size / 1024).toFixed(0)} KB</small></button>`);
+    }
+  }
   el.innerHTML =
-    hits
-      .slice(0, 250)
-      .map((m) => `<button class="hs-item" data-hs="add" data-pbo="${esc(m.pbo)}" data-path="${esc(m.name)}"><span>${esc(modelName(m.name))}</span><small>${esc(m.pbo)} · ${esc(m.name)} · ${(m.size / 1024).toFixed(0)} KB</small></button>`)
-      .join('') + (hits.length > 250 ? `<p class="info">… ${hits.length - 250} weitere – Suche verfeinern.</p>` : hits.length ? '' : '<p class="info">Nichts gefunden.</p>');
+    rows.join('') +
+    (totalHits > 250 ? `<p class="info">… ${totalHits - 250} weitere – Suche verfeinern.</p>` : totalHits ? '' : '<p class="info">Nichts gefunden.</p>');
 }
 
 $('houses').addEventListener('input', (e) => {
@@ -1011,7 +1118,7 @@ $('houses').addEventListener('change', (e) => {
     return;
   }
   const k = el.dataset.hs as 'x' | 'y' | 'z' | 'r';
-  if (!['x', 'y', 'z', 'r'].includes(k)) return;
+  if (k !== 'x' && k !== 'y' && k !== 'z' && k !== 'r') return;
   const s = sites.find((x) => x.id === el.closest<HTMLElement>('.hs-site')?.dataset.id);
   if (!s) return;
   s[k] = Number(el.value) || 0;
@@ -1091,10 +1198,19 @@ async function openGameFiles(input: HTMLInputElement) {
   });
   const isBuilding = (pbo: string, path: string) =>
     /structures|building|house|ruin|wreck|bunker|base/i.test(pbo) || /(^|\\)(houses?|buildings?|structures?|ruins?)\\/i.test(path);
-  catalog = openedPbos().flatMap((p) =>
-    pboModels(p.index).map((e) => ({ pbo: p.name, name: e.name, size: e.size, building: isBuilding(p.name + ' ' + p.index.prefix, e.name) })),
-  );
-  catalog.sort((a, b) => Number(b.building) - Number(a.building) || a.pbo.localeCompare(b.pbo) || a.name.localeCompare(b.name));
+  catalog = openedPbos().flatMap((p) => {
+    const pboLow = p.name.toLowerCase();
+    const pboAndPrefix = p.name + ' ' + p.index.prefix;
+    return pboModels(p.index).map((e) => ({
+      pbo: p.name,
+      pboLow,
+      name: e.name,
+      nameLow: e.name.toLowerCase(),
+      size: e.size,
+      building: isBuilding(pboAndPrefix, e.name),
+    }));
+  });
+  catalog.sort((a, b) => Number(b.building) - Number(a.building) || nameCollator.compare(a.pbo, b.pbo) || nameCollator.compare(a.name, b.name));
   houseBusy = '';
   houseQuery = '';
   await syncSites();

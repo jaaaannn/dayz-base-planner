@@ -20,6 +20,14 @@ interface ExportSpec {
 }
 
 const TRI_H = (GRID * Math.sqrt(3)) / 2;
+const hasOwn = Object.prototype.hasOwnProperty;
+const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
+
+const MAX_DZE_BYTES = 50 * 1024 * 1024; // 50 MB safety cap against accidental browser OOM
+const MAX_DZE_OBJECTS = 250_000;
+const MAX_DZE_STR_LEN = 4096;
+const MAX_DZE_SUBLIST = 10_000;
 
 export const DAYZ_CLASSES: Record<string, ExportSpec> = {
   wood_wall: { cls: 'Wood_Full_Wall' },
@@ -170,17 +178,21 @@ export const DAYZ_MODELS: Record<string, string> = {
   AM_WaterCoolerRack: "AftermathCollectables\\data\\Plastic\\bottle_rack.p3d",
 };
 
-const BY_CLASS = new Map(Object.entries(DAYZ_CLASSES).map(([id, s]) => [s.cls.toLowerCase(), id]));
-for (const [id, s] of Object.entries(DAYZ_CLASSES)) {
-  const m = DAYZ_MODELS[s.cls];
-  if (m) BY_CLASS.set(normModel(m), id);
-}
-
 function normModel(p: string) {
   return p.trim().replace(/\//g, '\\').replace(/^\\+/, '').toLowerCase();
 }
 
-const typeKey = (t: string) => (/\.p3d$/i.test(t.trim()) ? normModel(t) : t.toLowerCase());
+const BY_CLASS = new Map<string, string>();
+for (const [id, s] of Object.entries(DAYZ_CLASSES)) {
+  BY_CLASS.set(s.cls.toLowerCase(), id);
+  const m = DAYZ_MODELS[s.cls];
+  if (m) BY_CLASS.set(normModel(m), id);
+}
+
+const typeKey = (t: string) => {
+  const trimmed = t.trim();
+  return /\.p3d$/i.test(trimmed) ? normModel(trimmed) : trimmed.toLowerCase();
+};
 
 export const MAPS = [
   { id: 'chernarusplus', name: 'Chernarus' },
@@ -208,14 +220,20 @@ const wrap = (d: number) => {
   return a;
 };
 const r3 = (v: number) => Math.round(v * 1000) / 1000;
+const finite = (v: unknown) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
 
 /** Centre of the base footprint in planner coordinates. */
 export function baseCentre(pieces: Piece[]) {
   if (!pieces.length) return { x: 0, z: 0 };
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
   for (const p of pieces) {
-    minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x);
-    minZ = Math.min(minZ, p.z); maxZ = Math.max(maxZ, p.z);
+    if (p.x < minX) minX = p.x;
+    if (p.x > maxX) maxX = p.x;
+    if (p.z < minZ) minZ = p.z;
+    if (p.z > maxZ) maxZ = p.z;
   }
   return { x: (minX + maxX) / 2, z: (minZ + maxZ) / 2 };
 }
@@ -230,24 +248,38 @@ export interface ExportResult {
 
 export type ExportMode = 'model' | 'class';
 
+interface SaveObject {
+  Type: string;
+  DisplayName: string;
+  Position: [number, number, number];
+  Orientation: [number, number, number];
+  Scale: number;
+  Model: string;
+  Flags: number;
+}
+
 export function exportDze(pieces: Piece[], anchor: Anchor, mode: ExportMode = 'model'): ExportResult {
   const c = baseCentre(pieces);
   const A = rad(anchor.yaw);
-  const objects: unknown[] = [];
+  const cosA = Math.cos(A);
+  const sinA = Math.sin(A);
+  const objects: SaveObject[] = [];
   const skipped: string[] = [];
+
   for (const p of pieces) {
-    const spec = DAYZ_CLASSES[p.t];
+    const spec = hasOwn.call(DAYZ_CLASSES, p.t) ? DAYZ_CLASSES[p.t] : undefined;
     if (!spec) {
-      skipped.push(PARTS[p.t]?.name ?? p.t);
+      const partName = hasOwn.call(PARTS, p.t) ? PARTS[p.t]?.name : undefined;
+      skipped.push(partName ?? p.t);
       continue;
     }
     const [ox, oz] = spec.off ? rot(spec.off[0], spec.off[1], p.r) : [0, 0];
     const lx = p.x + ox - c.x;
     const lz = -(p.z + oz - c.z); // mirror into DayZ's left-handed frame
-    const wx = lx * Math.cos(A) + lz * Math.sin(A);
-    const wz = -lx * Math.sin(A) + lz * Math.cos(A);
+    const wx = lx * cosA + lz * sinA;
+    const wz = -lx * sinA + lz * cosA;
     const yaw = wrap(180 - deg(p.r) + (spec.yaw ?? 0) + anchor.yaw);
-    const model = DAYZ_MODELS[spec.cls];
+    const model = hasOwn.call(DAYZ_MODELS, spec.cls) ? DAYZ_MODELS[spec.cls] : undefined;
     const type = mode === 'model' && model ? model : spec.cls;
     objects.push({
       Type: type,
@@ -259,6 +291,7 @@ export function exportDze(pieces: Piece[], anchor: Anchor, mode: ExportMode = 'm
       Flags: 30,
     });
   }
+
   const now = Math.floor(Date.now() / 1000);
   const save = {
     MapName: anchor.map,
@@ -274,45 +307,56 @@ export function exportDze(pieces: Piece[], anchor: Anchor, mode: ExportMode = 'm
   return { json: JSON.stringify(save, null, 1), binary: encodeBinary(save), count: objects.length, skipped };
 }
 
-interface SaveObject {
-  Type: string;
-  DisplayName: string;
-  Position: number[];
-  Orientation: number[];
-  Scale: number;
-  Model: string;
-  Flags: number;
-}
-
 /**
  * EditorSaveData version 8, binned. Layout verified against a save written by
  * DayZ Editor: strings are int32 length + bytes, vectors int32 count (3) +
  * three floats, bools four bytes.
  */
 export function encodeBinary(save: { MapName: string; CameraPosition: number[]; LastModified: number; CreationDate: number; EditorObjects: unknown[] }) {
-  const parts: Uint8Array[] = [];
-  const te = new TextEncoder();
+  const objs = save.EditorObjects as SaveObject[];
+  let buf = new Uint8Array(Math.max(256, 128 + objs.length * 192));
+  let dv = new DataView(buf.buffer);
+  let pos = 0;
+
+  const ensure = (extra: number) => {
+    const needed = pos + extra;
+    if (needed <= buf.length) return;
+    let nextLen = buf.length;
+    while (nextLen < needed) nextLen *= 2;
+    const next = new Uint8Array(nextLen);
+    next.set(buf.subarray(0, pos));
+    buf = next;
+    dv = new DataView(buf.buffer);
+  };
+
   const int = (v: number) => {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setInt32(0, v, true);
-    parts.push(b);
+    ensure(4);
+    dv.setInt32(pos, v, true);
+    pos += 4;
   };
   const float = (v: number) => {
-    const b = new Uint8Array(4);
-    new DataView(b.buffer).setFloat32(0, v, true);
-    parts.push(b);
+    ensure(4);
+    dv.setFloat32(pos, v, true);
+    pos += 4;
   };
   const str = (t: string) => {
-    const e = te.encode(t);
-    int(e.length);
-    parts.push(e);
+    // Each UTF-16 code unit expands to at most 3 UTF-8 bytes
+    ensure(4 + t.length * 3);
+    const lenPos = pos;
+    pos += 4;
+    const { written } = textEncoder.encodeInto(t, buf.subarray(pos));
+    dv.setInt32(lenPos, written, true);
+    pos += written;
   };
   const vec = (v: number[]) => {
-    int(3);
-    float(v[0]);
-    float(v[1]);
-    float(v[2]);
+    ensure(16);
+    dv.setInt32(pos, 3, true);
+    dv.setFloat32(pos + 4, v[0], true);
+    dv.setFloat32(pos + 8, v[1], true);
+    dv.setFloat32(pos + 12, v[2], true);
+    pos += 16;
   };
+
   str('EditorBinned');
   int(8);
   str(save.MapName);
@@ -321,33 +365,27 @@ export function encodeBinary(save: { MapName: string; CameraPosition: number[]; 
   int(0); // credits
   int(save.LastModified | 0);
   int(save.CreationDate | 0);
-  const objs = save.EditorObjects as SaveObject[];
   int(objs.length);
   for (const o of objs) {
     str(o.Type);
     str(o.DisplayName);
     vec(o.Position);
     vec(o.Orientation);
-    float(o.Scale);
-    int(o.Flags);
-    int(0); // parameters
-    int(0); // editor only
-    int(0); // locked
-    int(1); // allow damage
-    int(0); // simulate
+    ensure(32);
+    dv.setFloat32(pos, o.Scale, true);
+    dv.setInt32(pos + 4, o.Flags, true);
+    dv.setInt32(pos + 8, 0, true); // parameters
+    dv.setInt32(pos + 12, 0, true); // editor only
+    dv.setInt32(pos + 16, 0, true); // locked
+    dv.setInt32(pos + 20, 1, true); // allow damage
+    dv.setInt32(pos + 24, 0, true); // simulate
+    pos += 28;
     str(o.Model);
     int(0); // attachments
   }
   int(0); // hidden objects
   int(0); // camera tracks
-  const total = parts.reduce((n, p) => n + p.length, 0);
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const p of parts) {
-    out.set(p, off);
-    off += p.length;
-  }
-  return out;
+  return buf.slice(0, pos);
 }
 
 // ------------------------------------------------------------------ reading
@@ -365,23 +403,26 @@ export interface DzeFile {
 }
 
 function readBinary(buf: ArrayBuffer): DzeFile {
+  const byteLength = buf.byteLength;
   const dv = new DataView(buf);
   let o = 0;
-  const td = new TextDecoder();
+
   const int = () => {
+    if (o + 4 > byteLength) throw new Error('eof');
     const v = dv.getInt32(o, true);
     o += 4;
     return v;
   };
   const float = () => {
+    if (o + 4 > byteLength) throw new Error('eof');
     const v = dv.getFloat32(o, true);
     o += 4;
-    return v;
+    return Number.isFinite(v) ? v : 0;
   };
   const str = () => {
     const n = int();
-    if (n < 0 || n > 4096 || o + n > buf.byteLength) throw new Error('bad string');
-    const s = td.decode(new Uint8Array(buf, o, n));
+    if (n < 0 || n > MAX_DZE_STR_LEN || o + n > byteLength) throw new Error('bad string');
+    const s = textDecoder.decode(new Uint8Array(buf, o, n));
     o += n;
     return s;
   };
@@ -391,6 +432,7 @@ function readBinary(buf: ArrayBuffer): DzeFile {
     if (n !== 3) throw new Error('bad vector');
     return [float(), float(), float()];
   };
+
   if (str() !== 'EditorBinned') throw new Error('not a binned .dze');
   const version = int();
   const map = str();
@@ -398,11 +440,14 @@ function readBinary(buf: ArrayBuffer): DzeFile {
   if (version >= 7) {
     str();
     const credits = int();
+    if (credits < 0 || credits > MAX_DZE_SUBLIST) throw new Error('bad credits');
     for (let i = 0; i < credits; i++) str();
     int();
     int();
   }
   const count = int();
+  if (count < 0 || count > MAX_DZE_OBJECTS) throw new Error('bad object count');
+
   const objects: DzeObject[] = [];
   let partial = false;
   for (let i = 0; i < count; i++) {
@@ -417,6 +462,7 @@ function readBinary(buf: ArrayBuffer): DzeFile {
       if (version < 2) continue;
       if (version < 8) {
         const n = int();
+        if (n < 0 || n > MAX_DZE_SUBLIST) throw new Error('bad flags');
         for (let k = 0; k < n; k++) str();
       }
       if (int() !== 0) {
@@ -425,7 +471,8 @@ function readBinary(buf: ArrayBuffer): DzeFile {
         break;
       }
       if (version < 3) continue;
-      o += 4 * 4; // EditorOnly, Locked, AllowDamage, Simulate
+      if (o + 16 > byteLength) throw new Error('eof');
+      o += 16; // EditorOnly, Locked, AllowDamage, Simulate
       if (version < 5) continue;
       str(); // model
       if (int() !== 0) {
@@ -441,16 +488,32 @@ function readBinary(buf: ArrayBuffer): DzeFile {
 }
 
 export async function readDze(file: File): Promise<DzeFile> {
+  if (file.size > MAX_DZE_BYTES) throw new Error('file too large');
   const buf = await file.arrayBuffer();
-  const head = new TextDecoder().decode(new Uint8Array(buf, 0, Math.min(64, buf.byteLength))).trimStart();
+  const head = textDecoder.decode(new Uint8Array(buf, 0, Math.min(64, buf.byteLength))).trimStart();
   if (head.startsWith('{')) {
-    const data = JSON.parse(new TextDecoder().decode(buf));
-    const objects: DzeObject[] = (data.EditorObjects ?? []).map((e: { Type: string; Position: number[]; Orientation: number[] }) => ({
-      type: String(e.Type ?? ''),
-      pos: [Number(e.Position?.[0]) || 0, Number(e.Position?.[1]) || 0, Number(e.Position?.[2]) || 0],
-      ori: [Number(e.Orientation?.[0]) || 0, Number(e.Orientation?.[1]) || 0, Number(e.Orientation?.[2]) || 0],
-    }));
-    return { map: String(data.MapName ?? ''), objects, partial: false };
+    const data: unknown = JSON.parse(textDecoder.decode(buf));
+    if (!data || typeof data !== 'object') throw new Error('invalid .dze json');
+    const obj = data as { MapName?: unknown; EditorObjects?: unknown };
+    const rawList = Array.isArray(obj.EditorObjects) ? obj.EditorObjects : [];
+    const limit = Math.min(rawList.length, MAX_DZE_OBJECTS);
+    const objects: DzeObject[] = [];
+    for (let i = 0; i < limit; i++) {
+      const e = rawList[i] as { Type?: unknown; Position?: unknown; Orientation?: unknown } | null;
+      if (!e || typeof e !== 'object') continue;
+      const pos = Array.isArray(e.Position) ? e.Position : [];
+      const ori = Array.isArray(e.Orientation) ? e.Orientation : [];
+      objects.push({
+        type: typeof e.Type === 'string' ? e.Type : String(e.Type ?? ''),
+        pos: [finite(pos[0]), finite(pos[1]), finite(pos[2])],
+        ori: [finite(ori[0]), finite(ori[1]), finite(ori[2])],
+      });
+    }
+    return {
+      map: typeof obj.MapName === 'string' ? obj.MapName : '',
+      objects,
+      partial: rawList.length > MAX_DZE_OBJECTS,
+    };
   }
   return readBinary(buf);
 }
@@ -464,18 +527,33 @@ export function anchorFrom(f: DzeFile): Anchor | null {
 
 /** Turn Aftermath parts found in a .dze back into planner pieces, around their centre. */
 export function piecesFromDze(f: DzeFile): { pieces: Omit<Piece, 'id'>[]; unknown: number } {
-  const known = f.objects.filter((o) => BY_CLASS.has(typeKey(o.type)));
-  if (!known.length) return { pieces: [], unknown: f.objects.length };
-  const floors = known.filter((o) => PARTS[BY_CLASS.get(typeKey(o.type))!].kind === 'floor');
-  const ground = floors.length ? Math.min(...floors.map((o) => o.pos[1])) - SLAB / 2 : Math.min(...known.map((o) => o.pos[1]));
+  const matched: { o: DzeObject; id: string }[] = [];
+  let minFloorY = Infinity;
+  let minAnyY = Infinity;
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
-  for (const o of known) {
-    minX = Math.min(minX, o.pos[0]); maxX = Math.max(maxX, o.pos[0]);
-    minZ = Math.min(minZ, o.pos[2]); maxZ = Math.max(maxZ, o.pos[2]);
+
+  for (const o of f.objects) {
+    const id = BY_CLASS.get(typeKey(o.type));
+    if (!id || !hasOwn.call(PARTS, id)) continue;
+    matched.push({ o, id });
+    const [px, py, pz] = o.pos;
+    if (PARTS[id].kind === 'floor' && py < minFloorY) minFloorY = py;
+    if (py < minAnyY) minAnyY = py;
+    if (px < minX) minX = px;
+    if (px > maxX) maxX = px;
+    if (pz < minZ) minZ = pz;
+    if (pz > maxZ) maxZ = pz;
   }
-  const cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
-  const pieces = known.map((o) => {
-    const id = BY_CLASS.get(typeKey(o.type))!;
+
+  if (!matched.length) return { pieces: [], unknown: f.objects.length };
+
+  const ground = minFloorY < Infinity ? minFloorY - SLAB / 2 : minAnyY;
+  const cx = (minX + maxX) / 2;
+  const cz = (minZ + maxZ) / 2;
+  const pieces: Omit<Piece, 'id'>[] = new Array(matched.length);
+
+  for (let i = 0; i < matched.length; i++) {
+    const { o, id } = matched[i];
     const spec = DAYZ_CLASSES[id];
     const r = rad(180 + (spec.yaw ?? 0) - o.ori[0]);
     const [ox, oz] = spec.off ? rot(spec.off[0], spec.off[1], r) : [0, 0];
@@ -484,7 +562,8 @@ export function piecesFromDze(f: DzeFile): { pieces: Omit<Piece, 'id'>[]; unknow
     const y = o.pos[1] - ground;
     const kind = PARTS[id].kind;
     const l = Math.max(0, Math.round((kind === 'floor' || kind === 'wall' ? y - SLAB / 2 : y - 0.3) / LEVEL_H));
-    return { t: id, x: r3(x), y: r3(y), z: r3(z), r: Math.round(r * 1e4) / 1e4, l: Math.min(7, l) };
-  });
-  return { pieces, unknown: f.objects.length - known.length };
+    pieces[i] = { t: id, x: r3(x), y: r3(y), z: r3(z), r: Math.round(r * 1e4) / 1e4, l: Math.min(7, l) };
+  }
+
+  return { pieces, unknown: f.objects.length - matched.length };
 }
